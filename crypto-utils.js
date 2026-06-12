@@ -62,13 +62,13 @@ export async function encrypt(data, password) {
     result.set(iv, salt.length);
     result.set(encryptedContentArr, salt.length + iv.length);
 
-    // Efficiently convert Uint8Array to Base64 using chunks to avoid stack limits
-    const chunks = [];
-    const chunk = 16384;
-    for (let i = 0; i < result.length; i += chunk) {
-        chunks.push(String.fromCharCode.apply(null, result.subarray(i, i + chunk)));
-    }
-    return btoa(chunks.join(''));
+    // Use Blob and FileReader for robust Base64 conversion without stack limits
+    const blob = new Blob([result]);
+    return new Promise((resolve) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(reader.result.split(',')[1]);
+        reader.readAsDataURL(blob);
+    });
 }
 
 /**
@@ -77,12 +77,12 @@ export async function encrypt(data, password) {
  */
 export async function decrypt(base64Data, password) {
     try {
-        const cleanedData = base64Data.replace(/[^A-Za-z0-9+/=]/g, '');
-        const binaryString = atob(cleanedData);
-        const bytes = new Uint8Array(binaryString.length);
-        for (let i = 0; i < binaryString.length; i++) {
-            bytes[i] = binaryString.charCodeAt(i);
-        }
+        const cleanedData = base64Data.replace(/[^A-Za-z0-9+/=]/g, '').trim();
+        
+        // Use fetch with data URI for robust Base64 to Uint8Array conversion
+        const resp = await fetch(`data:application/octet-stream;base64,${cleanedData}`);
+        const buffer = await resp.arrayBuffer();
+        const bytes = new Uint8Array(buffer);
 
         const salt = bytes.slice(0, SALT_LENGTH);
         const iv = bytes.slice(SALT_LENGTH, SALT_LENGTH + IV_LENGTH);

@@ -83,19 +83,16 @@ async function compressImage(dataUrl, maxWidth = 1200, maxHeight = 1200, quality
 }
 
 /**
- * Compresses data using gzip if available
+ * Compresses data using gzip if available with modern stream handling
  */
 async function compressData(data) {
     if (typeof CompressionStream === 'undefined') return data;
     try {
-        const cs = new CompressionStream('gzip');
-        const writer = cs.writable.getWriter();
-        writer.write(data);
-        writer.close();
-        const res = await new Response(cs.readable).arrayBuffer();
-        return new Uint8Array(res);
+        const stream = new Blob([data]).stream().pipeThrough(new CompressionStream('gzip'));
+        const buffer = await new Response(stream).arrayBuffer();
+        return new Uint8Array(buffer);
     } catch (e) {
-        console.warn('Compression failed, using raw data', e);
+        console.warn('Compression failed', e);
         return data;
     }
 }
@@ -104,15 +101,13 @@ async function compressData(data) {
  * Decompresses data using gzip if it looks like gzip data
  */
 async function decompressData(data) {
+    if (!data || data.length < 2) return data;
     // GZIP magic header is 1f 8b
     if (data[0] !== 0x1f || data[1] !== 0x8b || typeof DecompressionStream === 'undefined') return data;
     try {
-        const ds = new DecompressionStream('gzip');
-        const writer = ds.writable.getWriter();
-        writer.write(data);
-        writer.close();
-        const res = await new Response(ds.readable).arrayBuffer();
-        return new Uint8Array(res);
+        const stream = new Blob([data]).stream().pipeThrough(new DecompressionStream('gzip'));
+        const buffer = await new Response(stream).arrayBuffer();
+        return new Uint8Array(buffer);
     } catch (e) {
         console.warn('Decompression failed', e);
         return data;
@@ -166,9 +161,10 @@ function updateOutput(decodedBytes) {
         const data = decodedBytes;
         // Check for MAGIC 'C7N'
         if (data[0] === 67 && data[1] === 55 && data[2] === 78) {
-            const textLen = (data[3] << 24) | (data[4] << 16) | (data[5] << 8) | data[6];
-            const textBytes = data.slice(7, 7 + textLen);
-            const imageBytes = data.slice(7 + textLen);
+            const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+            const textLen = view.getUint32(MAGIC.length);
+            const textBytes = data.slice(MAGIC.length + 4, MAGIC.length + 4 + textLen);
+            const imageBytes = data.slice(MAGIC.length + 4 + textLen);
             
             const text = new TextDecoder().decode(textBytes);
             if (imageBytes.length > 0) {
@@ -176,7 +172,9 @@ function updateOutput(decodedBytes) {
                 outputImage.src = URL.createObjectURL(blob);
                 outputImage.classList.remove('hidden');
             }
-            outputText.textContent = text || (imageBytes.length > 0 ? "[Decrypted Image]" : "");
+            const finalDisplay = text || (imageBytes.length > 0 ? "[Decrypted Image]" : "");
+            outputText.textContent = finalDisplay;
+            lastFullResult = finalDisplay; // Allow copying decrypted content
             return;
         }
     } catch (e) {
@@ -261,9 +259,12 @@ async function runIntegrityTest(imageData) {
         const textBytes = new TextEncoder().encode("TEST_INTEGRITY");
         const payload = new Uint8Array(MAGIC.length + 4 + textBytes.length + imageData.length);
         payload.set(MAGIC, 0);
-        payload.set([0, 0, 0, textBytes.length], 3); // Simple 4-byte length
-        payload.set(textBytes, 7);
-        payload.set(imageData, 7 + textBytes.length);
+        
+        const view = new DataView(payload.buffer);
+        view.setUint32(MAGIC.length, textBytes.length);
+        
+        payload.set(textBytes, MAGIC.length + 4);
+        payload.set(imageData, MAGIC.length + 4 + textBytes.length);
 
         const compressed = await compressData(payload);
         const encrypted = await encrypt(compressed, password);
@@ -334,13 +335,15 @@ compressSlider.addEventListener('input', () => {
 const reprocessImage = async () => {
     if (rawOriginalImage) {
         try {
-            const quality = parseInt(qualitySlider.value) / 1000;
+            const baseQuality = parseInt(qualitySlider.value) / 1000;
             const compression = parseInt(compressSlider.value);
-            // Higher compression (1-100) reduces the max dimension from 1500 down to 100
+            
+            // Higher compression (1-100) reduces max dimension and further reduces quality
             const maxDim = Math.max(100, 1500 - (compression * 14));
+            const finalQuality = Math.max(0.01, baseQuality * (1 - (compression / 110)));
             
             showToast('Processing...', 'info');
-            currentImageData = await compressImage(rawOriginalImage, maxDim, maxDim, quality);
+            currentImageData = await compressImage(rawOriginalImage, maxDim, maxDim, finalQuality);
             
             if (currentImagePreviewUrl) URL.revokeObjectURL(currentImagePreviewUrl);
             currentImagePreviewUrl = URL.createObjectURL(new Blob([currentImageData], { type: 'image/jpeg' }));
@@ -419,13 +422,12 @@ if (encryptBtn) {
                 const textBytes = new TextEncoder().encode(text);
                 const combined = new Uint8Array(MAGIC.length + 4 + textBytes.length + currentImageData.length);
                 combined.set(MAGIC, 0);
-                // Pack length into 4 bytes (big endian)
-                combined[3] = (textBytes.length >> 24) & 0xFF;
-                combined[4] = (textBytes.length >> 16) & 0xFF;
-                combined[5] = (textBytes.length >> 8) & 0xFF;
-                combined[6] = textBytes.length & 0xFF;
-                combined.set(textBytes, 7);
-                combined.set(currentImageData, 7 + textBytes.length);
+                
+                const view = new DataView(combined.buffer);
+                view.setUint32(MAGIC.length, textBytes.length);
+                
+                combined.set(textBytes, MAGIC.length + 4);
+                combined.set(currentImageData, MAGIC.length + 4 + textBytes.length);
                 finalPayload = await compressData(combined);
             } else {
                 finalPayload = await compressData(new TextEncoder().encode(text));
