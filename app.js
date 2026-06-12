@@ -13,6 +13,8 @@ const removeImageBtn = getEl('remove-image-btn');
 const qualitySettings = getEl('quality-settings');
 const qualitySlider = getEl('quality-slider');
 const qualityValue = getEl('quality-value');
+const compressSlider = getEl('compress-slider');
+const compressValue = getEl('compress-value');
 const progressContainer = getEl('progress-container');
 const progressBar = getEl('progress-bar');
 const progressLabel = getEl('progress-label');
@@ -32,13 +34,17 @@ const DEFAULT_KEY = "CRYPTON_DEFAULT_KEY_2024";
 const audioContext = new (window.AudioContext || window.webkitAudioContext)();
 let successBuffer, errorBuffer;
 
-let currentImageData = null;
-let rawOriginalImage = null;
+let currentImageData = null; // Uint8Array of the compressed image bytes
+let currentImageMime = 'image/jpeg';
+let currentImagePreviewUrl = null;
+let rawOriginalImage = null; // Original dataURL from file reader
 let lastFullResult = ""; // Stores the complete raw string for copying
 
+// Binary format magic number: 'C7N' (Crypton)
+const MAGIC = new Uint8Array([67, 55, 78]);
+
 /**
- * Compresses an image to ensure it fits within reasonable encryption limits
- * while preserving visibility.
+ * Compresses an image and returns binary data.
  */
 async function compressImage(dataUrl, maxWidth = 1200, maxHeight = 1200, quality = 0.4) {
     return new Promise((resolve, reject) => {
@@ -46,7 +52,6 @@ async function compressImage(dataUrl, maxWidth = 1200, maxHeight = 1200, quality
         img.onload = () => {
             let width = img.width;
             let height = img.height;
-
             if (width > height) {
                 if (width > maxWidth) {
                     height *= maxWidth / width;
@@ -58,22 +63,60 @@ async function compressImage(dataUrl, maxWidth = 1200, maxHeight = 1200, quality
                     height = maxHeight;
                 }
             }
-
             const canvas = document.createElement('canvas');
             canvas.width = width;
             canvas.height = height;
             const ctx = canvas.getContext('2d');
-            // Use smoothing
             ctx.imageSmoothingEnabled = true;
             ctx.imageSmoothingQuality = 'high';
             ctx.drawImage(img, 0, 0, width, height);
             
-            // Output as JPEG for significantly better compression than PNG
-            resolve(canvas.toDataURL('image/jpeg', quality));
+            canvas.toBlob(async (blob) => {
+                if (!blob) return reject(new Error('Canvas toBlob failed'));
+                const buffer = await blob.arrayBuffer();
+                resolve(new Uint8Array(buffer));
+            }, 'image/jpeg', quality);
         };
         img.onerror = () => reject(new Error('Image loading failed'));
         img.src = dataUrl;
     });
+}
+
+/**
+ * Compresses data using gzip if available
+ */
+async function compressData(data) {
+    if (typeof CompressionStream === 'undefined') return data;
+    try {
+        const cs = new CompressionStream('gzip');
+        const writer = cs.writable.getWriter();
+        writer.write(data);
+        writer.close();
+        const res = await new Response(cs.readable).arrayBuffer();
+        return new Uint8Array(res);
+    } catch (e) {
+        console.warn('Compression failed, using raw data', e);
+        return data;
+    }
+}
+
+/**
+ * Decompresses data using gzip if it looks like gzip data
+ */
+async function decompressData(data) {
+    // GZIP magic header is 1f 8b
+    if (data[0] !== 0x1f || data[1] !== 0x8b || typeof DecompressionStream === 'undefined') return data;
+    try {
+        const ds = new DecompressionStream('gzip');
+        const writer = ds.writable.getWriter();
+        writer.write(data);
+        writer.close();
+        const res = await new Response(ds.readable).arrayBuffer();
+        return new Uint8Array(res);
+    } catch (e) {
+        console.warn('Decompression failed', e);
+        return data;
+    }
 }
 
 async function loadSounds() {
@@ -113,15 +156,35 @@ function showToast(message, type = 'info') {
     }, 3000);
 }
 
-function updateOutput(content) {
+function updateOutput(decodedBytes) {
     outputContainer.classList.remove('hidden');
     outputImage.classList.add('hidden');
     outputText.textContent = "";
     
-    // Store the full content in our persistent variable for the copy button
-    lastFullResult = content;
+    // Attempt binary unpacking
+    try {
+        const data = decodedBytes;
+        // Check for MAGIC 'C7N'
+        if (data[0] === 67 && data[1] === 55 && data[2] === 78) {
+            const textLen = (data[3] << 24) | (data[4] << 16) | (data[5] << 8) | data[6];
+            const textBytes = data.slice(7, 7 + textLen);
+            const imageBytes = data.slice(7 + textLen);
+            
+            const text = new TextDecoder().decode(textBytes);
+            if (imageBytes.length > 0) {
+                const blob = new Blob([imageBytes], { type: 'image/jpeg' });
+                outputImage.src = URL.createObjectURL(blob);
+                outputImage.classList.remove('hidden');
+            }
+            outputText.textContent = text || (imageBytes.length > 0 ? "[Decrypted Image]" : "");
+            return;
+        }
+    } catch (e) {
+        console.warn('Binary unpacking failed, trying JSON/Text', e);
+    }
 
-    // Check if content is a JSON string (for image + text)
+    // Fallback to text/JSON
+    const content = new TextDecoder().decode(decodedBytes);
     try {
         const parsed = JSON.parse(content);
         if (parsed && typeof parsed === 'object' && (parsed.t || parsed.i)) {
@@ -129,24 +192,12 @@ function updateOutput(content) {
                 outputImage.src = parsed.i;
                 outputImage.classList.remove('hidden');
             }
-            // For UI display, we show only the text part if it's a JSON payload
-            outputText.textContent = parsed.t || "";
-            
-            // If it's a message result, we might prefer to copy just the message
-            // But if there's no message and it's just an image, we should ensure copying works
-            if (!parsed.t && parsed.i) {
-                outputText.textContent = "[Decrypted Image]";
-            }
+            outputText.textContent = parsed.t || (parsed.i ? "[Decrypted Image]" : "");
             return;
         }
-    } catch (e) {
-        // Not JSON, treat as raw text
-    }
+    } catch (e) {}
     
-    // Display raw content (usually encrypted base64)
     outputText.textContent = content;
-    
-    // Ensure we scroll the output container into view
     outputContainer.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
 }
 
@@ -207,12 +258,20 @@ async function runIntegrityTest(imageData) {
     imagePreviewContainer.classList.remove('test-passed', 'test-failed');
 
     try {
-        const payload = JSON.stringify({ t: "TEST_INTEGRITY", i: imageData });
-        const encrypted = await encrypt(payload, password);
-        const decrypted = await decrypt(encrypted, password);
+        const textBytes = new TextEncoder().encode("TEST_INTEGRITY");
+        const payload = new Uint8Array(MAGIC.length + 4 + textBytes.length + imageData.length);
+        payload.set(MAGIC, 0);
+        payload.set([0, 0, 0, textBytes.length], 3); // Simple 4-byte length
+        payload.set(textBytes, 7);
+        payload.set(imageData, 7 + textBytes.length);
+
+        const compressed = await compressData(payload);
+        const encrypted = await encrypt(compressed, password);
+        const decryptedBytes = await decrypt(encrypted, password);
+        const decompressed = await decompressData(decryptedBytes);
         
-        const parsed = JSON.parse(decrypted);
-        if (parsed.i === imageData) {
+        // Basic check: length and magic
+        if (decompressed[0] === 67 && decompressed[1] === 55 && decompressed[2] === 78) {
             integrityBadge.className = 'integrity-badge success';
             integrityBadge.querySelector('.label').textContent = 'Integrity OK';
             imagePreviewContainer.classList.add('test-passed');
@@ -239,9 +298,13 @@ imageInput.addEventListener('change', async (e) => {
             try {
                 rawOriginalImage = event.target.result;
                 const quality = parseInt(qualitySlider.value) / 1000;
+                const compression = parseInt(compressSlider.value);
+                const maxDim = Math.max(100, 1500 - (compression * 14));
                 
-                currentImageData = await compressImage(rawOriginalImage, 1200, 1200, quality);
-                imagePreview.src = currentImageData;
+                currentImageData = await compressImage(rawOriginalImage, maxDim, maxDim, quality);
+                if (currentImagePreviewUrl) URL.revokeObjectURL(currentImagePreviewUrl);
+                currentImagePreviewUrl = URL.createObjectURL(new Blob([currentImageData], { type: 'image/jpeg' }));
+                imagePreview.src = currentImagePreviewUrl;
                 imagePreviewContainer.classList.remove('hidden');
                 qualitySettings.classList.remove('hidden');
                 imagePreviewContainer.classList.remove('test-passed', 'test-failed');
@@ -264,19 +327,34 @@ qualitySlider.addEventListener('input', async () => {
     qualityValue.textContent = `${(val / 10).toFixed(1)}%`;
 });
 
-qualitySlider.addEventListener('change', async () => {
+compressSlider.addEventListener('input', () => {
+    compressValue.textContent = compressSlider.value;
+});
+
+const reprocessImage = async () => {
     if (rawOriginalImage) {
         try {
             const quality = parseInt(qualitySlider.value) / 1000;
-            showToast('Re-compressing...', 'info');
-            currentImageData = await compressImage(rawOriginalImage, 1200, 1200, quality);
-            imagePreview.src = currentImageData;
+            const compression = parseInt(compressSlider.value);
+            // Higher compression (1-100) reduces the max dimension from 1500 down to 100
+            const maxDim = Math.max(100, 1500 - (compression * 14));
+            
+            showToast('Processing...', 'info');
+            currentImageData = await compressImage(rawOriginalImage, maxDim, maxDim, quality);
+            
+            if (currentImagePreviewUrl) URL.revokeObjectURL(currentImagePreviewUrl);
+            currentImagePreviewUrl = URL.createObjectURL(new Blob([currentImageData], { type: 'image/jpeg' }));
+            imagePreview.src = currentImagePreviewUrl;
+            
             await runIntegrityTest(currentImageData);
         } catch (err) {
-            showToast('Compression failed', 'error');
+            showToast('Processing failed', 'error');
         }
     }
-});
+};
+
+qualitySlider.addEventListener('change', reprocessImage);
+compressSlider.addEventListener('change', reprocessImage);
 
 removeImageBtn.addEventListener('click', () => {
     currentImageData = null;
@@ -335,15 +413,25 @@ if (encryptBtn) {
             encryptBtn.disabled = true;
             encryptBtn.textContent = 'Encrypting...';
             
-            // Package text and image into a single string for encryption
-            let payload = text;
+            let finalPayload;
             if (currentImageData) {
-                payload = JSON.stringify({ t: text, i: currentImageData });
+                // Binary Packing: Magic(3) + TextLen(4) + Text(N) + Image(M)
+                const textBytes = new TextEncoder().encode(text);
+                const combined = new Uint8Array(MAGIC.length + 4 + textBytes.length + currentImageData.length);
+                combined.set(MAGIC, 0);
+                // Pack length into 4 bytes (big endian)
+                combined[3] = (textBytes.length >> 24) & 0xFF;
+                combined[4] = (textBytes.length >> 16) & 0xFF;
+                combined[5] = (textBytes.length >> 8) & 0xFF;
+                combined[6] = textBytes.length & 0xFF;
+                combined.set(textBytes, 7);
+                combined.set(currentImageData, 7 + textBytes.length);
+                finalPayload = await compressData(combined);
+            } else {
+                finalPayload = await compressData(new TextEncoder().encode(text));
             }
 
-            const result = await withProgress('Encrypting Data...', () => encrypt(payload, password));
-            
-            // Store the full raw result for reliable copying
+            const result = await withProgress('Encrypting Data...', () => encrypt(finalPayload, password));
             lastFullResult = result;
             
             // Update UI
@@ -400,8 +488,9 @@ if (decryptBtn) {
             decryptBtn.disabled = true;
             decryptBtn.textContent = 'Decrypting...';
             
-            const result = await withProgress('Decrypting Data...', () => decrypt(encryptedText, password));
-            updateOutput(result);
+            const decryptedBytes = await withProgress('Decrypting Data...', () => decrypt(encryptedText, password));
+            const decompressed = await decompressData(decryptedBytes);
+            updateOutput(decompressed);
             
             showToast('Decrypted successfully!', 'success');
             playSound(successBuffer);
